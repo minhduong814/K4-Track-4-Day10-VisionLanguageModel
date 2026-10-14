@@ -23,6 +23,8 @@ sys.path.insert(0, str(ROOT))
 from scripts.score import evaluate, parse_output
 
 MODEL = "Qwen/Qwen3-VL-4B-Instruct"
+LLM_TARGETS = r"model\.language_model\.layers\.\d+\.(?:self_attn\.(?:q|k|v|o)_proj|mlp\.(?:gate|up|down)_proj)"
+VIT_TARGETS = r"model\.visual\.blocks\.\d+\.(?:attn\.(?:qkv|proj)|mlp\.(?:linear_fc1|linear_fc2))"
 PROMPT = ('Detect all potholes, cracks and manholes. Return only a JSON list of objects '
           'with keys "label" (pothole, crack, manhole) and "bbox_2d" '
           '([x1,y1,x2,y2], integer coordinates normalized to 0–1000). '
@@ -71,9 +73,7 @@ def projector(name):
 def setup(model, cfg):
     for p in model.parameters():
         p.requires_grad = False
-    llm = r"model\.language_model\.layers\.\d+\.(?:self_attn\.(?:q|k|v|o)_proj|mlp\.(?:gate|up|down)_proj)"
-    vit = r"model\.visual\.blocks\.\d+\.(?:attn\.(?:qkv|proj)|mlp\.(?:linear_fc1|linear_fc2))"
-    regex = llm if cfg["lora"]["targets"] == "llm" else f"(?:{llm}|{vit})"
+    regex = LLM_TARGETS if cfg["lora"]["targets"] == "llm" else f"(?:{LLM_TARGETS}|{VIT_TARGETS})"
     matched = [n for n, _ in model.named_modules() if re.fullmatch(regex, n)]
     expected = 252 if cfg["lora"]["targets"] == "llm" else 348
     if len(matched) != expected:
@@ -298,14 +298,7 @@ def figures(name):
     write_json(folder / "captions.json", manifest)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--batch-size", type=int, default=1)
-    ap.add_argument("--grad-accum", type=int, default=8)
-    args = ap.parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU required")
-    processor = AutoProcessor.from_pretrained(MODEL)
+def initialize():
     split_rows = {s: rows(s) for s in ("train", "val", "test")}
     sessions = {s: {r["session"] for r in rr} for s, rr in split_rows.items()}
     assert all(not sessions[a] & sessions[b] for a, b in (("train", "val"), ("train", "test"), ("val", "test")))
@@ -313,25 +306,44 @@ def main():
     write_json(ROOT / "report/runs/environment.json", {"torch": torch.__version__,
                "gpu": torch.cuda.get_device_name(0), "source_commit": subprocess.check_output(
                    ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()})
-    results = {}
-    results["e0"] = score("e0", "test", infer("e0", "test", processor, False), {})
-    validation, configs = {}, {}
-    for name in ("e1", "e2", "e3"):
+
+
+def experiment_config(name, batch_size, grad_accum):
+    if name.startswith("e4_rank_"):
+        selection = json.loads((ROOT / "report/runs/e4_selection.json").read_text(encoding="utf-8"))
+        # Copy the actual training configuration, not a fresh set of defaults.
+        cfg = json.loads((ROOT / f"report/runs/{selection['base']}.json").read_text(encoding="utf-8"))["config"]
+        cfg = copy.deepcopy(cfg)
+        rank = int(name.rsplit("_", 1)[1])
+        cfg["lora"].update(r=rank, alpha=2*rank)
+    else:
         cfg = yaml.safe_load((ROOT / f"configs/{name}.yaml").read_text(encoding="utf-8"))
-        cfg.update(batch_size=args.batch_size, grad_accum=args.grad_accum)
-        configs[name] = cfg
-        meta = train(cfg, name, processor)
-        validation[name] = score(name, "val", infer(name, "val", processor, True), meta)
-        results[name] = score(name, "test", infer(name, "test", processor, True), meta)
+        cfg.update(batch_size=batch_size, grad_accum=grad_accum)
+    return cfg
+
+
+def evaluate_trained(name, processor):
+    run = json.loads((ROOT / f"report/runs/{name}.json").read_text(encoding="utf-8"))
+    meta = {k: run[k] for k in ("trainable_params", "peak_vram_gb", "train_minutes")}
+    if not name.startswith("e4_"):
+        score(name, "val", infer(name, "val", processor, True), meta)
+    score(name, "test", infer(name, "test", processor, True), meta)
+
+
+def select_e4():
+    validation = {name: json.loads((ROOT / f"report/validation/{name}.json").read_text(encoding="utf-8"))
+                  for name in ("e1", "e2", "e3")}
     best = max(validation, key=lambda n: validation[n]["micro"]["f1"])
     write_json(ROOT / "report/runs/e4_selection.json", {"base": best, "selection_split": "val",
                 "variable": "rank", "values": [4, 64], "validation_f1": {n: v["micro"]["f1"] for n, v in validation.items()}})
-    for rank in (4, 64):
-        name = f"e4_rank_{rank}"
-        cfg = copy.deepcopy(configs[best])
-        cfg["lora"].update(r=rank, alpha=2*rank)
-        meta = train(cfg, name, processor)
-        results[name] = score(name, "test", infer(name, "test", processor, True), meta)
+    print(f"E4 base selected on validation: {best}; compare rank 4 vs 64", flush=True)
+    return best
+
+
+def summarize():
+    best = json.loads((ROOT / "report/runs/e4_selection.json").read_text(encoding="utf-8"))["base"]
+    results = {name: json.loads((ROOT / f"report/evidence/{name}.json").read_text(encoding="utf-8"))
+               for name in ("e0", "e1", "e2", "e3", "e4_rank_4", "e4_rank_64")}
     figures(best)
     write_json(ROOT / "report/summary.json", results)
     fields = "| Setup | F1 | CI95 | FP/image | pothole | crack | manhole | VRAM GB | Train min |\n|---|---|---|---|---|---|---|---|---|\n"
@@ -345,6 +357,86 @@ def main():
     (ROOT / "report/submission_check.txt").write_text(check.stdout+check.stderr, encoding="utf-8")
     write_json(ROOT / "report/runs/status.json", {"pipeline": "completed", "submission_check_exit_code": check.returncode,
                "report_pending": True})
+
+
+def check_mask(processor):
+    entry = rows("train")[0]
+    sample = Examples([entry], processor)[0]
+    token_id = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    image_tokens = int((sample["input_ids"] == token_id).sum())
+    supervised = processor.tokenizer.decode(sample["labels"][sample["labels"] != -100], skip_special_tokens=True).strip()
+    assert image_tokens == 220, f"Expected 220 image tokens; got {image_tokens}"
+    assert supervised == answer(entry), "Supervised tokens must decode to the JSON answer"
+    result = {"image_id": entry["image_id"], "image_tokens": image_tokens,
+              "supervised_text": supervised, "input_shapes": {k: list(v.shape) for k, v in sample.items()}}
+    write_json(ROOT / "report/runs/mask_check.json", result)
+    print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+
+
+def preview_labels():
+    entry = rows("train")[0]
+    print("Prompt:", PROMPT, flush=True)
+    print("Example image:", entry["image_id"], "Ground truth JSON:", answer(entry), flush=True)
+    with Image.open(ROOT / "data" / entry["image_path"]) as source:
+        im = source.convert("RGB")
+    draw = ImageDraw.Draw(im)
+    for box in json.loads(answer(entry)):
+        coords = [v * (im.width if j % 2 == 0 else im.height) / 1000 for j, v in enumerate(box["bbox_2d"])]
+        draw.rectangle(coords, outline="lime", width=2)
+        draw.text((coords[0], max(0, coords[1]-12)), box["label"], fill="lime")
+    folder = ROOT / "report/figures"
+    folder.mkdir(parents=True, exist_ok=True)
+    im.save(folder / "train_ground_truth.png")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--batch-size", type=int, default=1)
+    ap.add_argument("--grad-accum", type=int, default=8)
+    ap.add_argument("--stage", default="all", choices=["all", "labels", "e0", "mask", "configs", "train", "evaluate", "select-e4", "summary"])
+    ap.add_argument("--name", choices=["e1", "e2", "e3", "e4_rank_4", "e4_rank_64"])
+    args = ap.parse_args()
+    if args.batch_size < 1 or args.grad_accum < 1:
+        ap.error("Batch size and accumulation must be positive")
+    if args.stage in ("train", "evaluate") and not args.name:
+        ap.error("--name is required for train/evaluate")
+    if args.stage == "labels":
+        preview_labels()
+        return
+    if args.stage == "configs":
+        print("LLM LoRA targets:", LLM_TARGETS)
+        print("ViT LoRA targets (E3):", VIT_TARGETS)
+        for name in ("e1", "e2", "e3"):
+            print(name, json.dumps(experiment_config(name, args.batch_size, args.grad_accum), ensure_ascii=False))
+        return
+    if args.stage == "select-e4":
+        select_e4()
+        return
+    if args.stage == "summary":
+        summarize()
+        return
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU required")
+    processor = AutoProcessor.from_pretrained(MODEL)
+    if args.stage in ("all", "e0"):
+        initialize()
+        score("e0", "test", infer("e0", "test", processor, False), {})
+    if args.stage in ("all", "mask"):
+        check_mask(processor)
+    if args.stage == "train":
+        train(experiment_config(args.name, args.batch_size, args.grad_accum), args.name, processor)
+    if args.stage == "evaluate":
+        evaluate_trained(args.name, processor)
+    if args.stage == "all":
+        for name in ("e1", "e2", "e3"):
+            train(experiment_config(name, args.batch_size, args.grad_accum), name, processor)
+            evaluate_trained(name, processor)
+        select_e4()
+        for rank in (4, 64):
+            name = f"e4_rank_{rank}"
+            train(experiment_config(name, args.batch_size, args.grad_accum), name, processor)
+            evaluate_trained(name, processor)
+        summarize()
 
 
 if __name__ == "__main__":

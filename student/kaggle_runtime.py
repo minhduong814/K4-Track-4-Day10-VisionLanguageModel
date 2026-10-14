@@ -2,6 +2,23 @@
 import warnings
 
 
+def configure_hf_token(secrets, environ):
+    """Export the optional Kaggle secret before starting Hugging Face subprocesses."""
+    try:
+        token = secrets.get_secret("HF_TOKEN")
+    except Exception:
+        # Missing or ungranted secret: public model downloads can continue.
+        # Never print exception details, which may contain authentication data.
+        token = None
+    if token and token.strip():
+        environ["HF_TOKEN"] = token.strip()
+    enabled = bool(environ.get("HF_TOKEN", "").strip())
+    print("HF_TOKEN configured for model downloads." if enabled else
+          "HF_TOKEN not configured; public model downloads will be unauthenticated. "
+          "To authenticate, enable the HF_TOKEN secret in Kaggle Add-ons > Secrets.")
+    return enabled
+
+
 def report_gpu(torch):
     if not torch.cuda.is_available():
         raise RuntimeError("Enable a CUDA GPU in Kaggle Settings before running")

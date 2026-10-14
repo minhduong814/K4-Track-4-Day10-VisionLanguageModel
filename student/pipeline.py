@@ -57,6 +57,13 @@ def messages(image):
     return [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": PROMPT}]}]
 
 
+def encode_chat(processor, conversation, *, add_generation_prompt, padding=False):
+    # transformers 5.19 routes processor options through processor_kwargs.
+    return processor.apply_chat_template(conversation, tokenize=True,
+        add_generation_prompt=add_generation_prompt, return_dict=True, return_tensors="pt",
+        processor_kwargs={"padding": padding})
+
+
 def load_base():
     quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                               bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True,
@@ -70,6 +77,56 @@ def projector(name):
     return "visual.merger." in name or "visual.deepstack_merger_list." in name
 
 
+def trainable_group(name, cfg):
+    """Select exactly the parameters authorized by an E1/E2/E3 setup."""
+    name = name.removeprefix("base_model.model.")
+    adapter = re.fullmatch(r"(.+)\.lora_[AB]\.[^.]+\.weight", name)
+    if adapter:
+        module = adapter.group(1)
+        if re.fullmatch(LLM_TARGETS, module):
+            return "llm_lora"
+        if cfg["lora"]["targets"] == "llm+vit" and re.fullmatch(VIT_TARGETS, module):
+            return "vit_lora"
+        return None
+    if cfg["train_projector"] and re.match(r"model\.visual\.(?:merger\.|deepstack_merger_list\.\d+\.)", name):
+        return "projector"
+    return None
+
+
+def finalize_trainable_parameters(model, cfg):
+    # Apply this AFTER PEFT/checkpointing setup and BEFORE creating the optimizer.
+    # Frozen NF4/vision weights retain their dtype; all optimizer parameters use fp32.
+    groups = {"llm_lora": 0, "vit_lora": 0, "projector": 0}
+    audit = {"groups": groups, "parameters": [], "refrozen": [], "promoted_to_fp32": []}
+    for name, param in model.named_parameters():
+        group = trainable_group(name, cfg)
+        if param.requires_grad and group is None:
+            audit["refrozen"].append(name)
+        param.requires_grad = group is not None
+        if group is None:
+            continue
+        if not param.is_floating_point():
+            raise RuntimeError(f"Trainable parameter is quantized/nonfloating: {name}")
+        if param.dtype != torch.float32:
+            param.data = param.data.float()
+            audit["promoted_to_fp32"].append(name)
+        if param.dtype != torch.float32:
+            raise RuntimeError(f"AMP optimizer parameter must be fp32: {name}: {param.dtype}")
+        groups[group] += param.numel()
+        audit["parameters"].append({"name": name, "group": group, "dtype": str(param.dtype), "numel": param.numel()})
+    if not groups["llm_lora"]:
+        raise RuntimeError("No LLM LoRA parameters selected")
+    if cfg["train_projector"] and not groups["projector"]:
+        raise RuntimeError("Projector training requested but no projector parameters found")
+    if cfg["lora"]["targets"] == "llm+vit" and not groups["vit_lora"]:
+        raise RuntimeError("ViT LoRA requested but no ViT adapter parameters found")
+    audit["trainable_params"] = sum(groups.values())
+    print("Trainable groups (all fp32):", json.dumps(groups), flush=True)
+    if audit["refrozen"]:
+        print("Refroze parameters outside the experiment setup:", audit["refrozen"][:10], flush=True)
+    return audit
+
+
 def setup(model, cfg):
     for p in model.parameters():
         p.requires_grad = False
@@ -81,13 +138,11 @@ def setup(model, cfg):
     model.enable_input_require_grads()
     model = get_peft_model(model, LoraConfig(r=cfg["lora"]["r"], lora_alpha=cfg["lora"]["alpha"],
         lora_dropout=cfg["lora"]["dropout"], target_modules=regex, task_type="CAUSAL_LM"))
-    if cfg["train_projector"]:
-        for n, p in model.named_parameters():
-            if projector(n):
-                p.data = p.data.float()
-                p.requires_grad = True
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.config.use_cache = False
+    model.config.text_config.use_cache = False
+    model._lab_setup_audit = finalize_trainable_parameters(model, cfg)
+    model._lab_setup_audit["matched_modules"] = matched
     model.print_trainable_parameters()
     return model
 
@@ -103,10 +158,9 @@ class Examples(Dataset):
         entry = self.entries[index]
         with Image.open(ROOT / "data" / entry["image_path"]) as im:
             user = messages(im.convert("RGB"))
-            kwargs = dict(tokenize=True, return_dict=True, return_tensors="pt")
-            prompt = self.processor.apply_chat_template(user, add_generation_prompt=True, **kwargs)
-            full = self.processor.apply_chat_template(user + [{"role": "assistant", "content": answer(entry)}],
-                                                      add_generation_prompt=False, **kwargs)
+            prompt = encode_chat(self.processor, user, add_generation_prompt=True)
+            full = encode_chat(self.processor, user + [{"role": "assistant", "content": answer(entry)}],
+                               add_generation_prompt=False)
         n = prompt["input_ids"].shape[1]
         assert torch.equal(full["input_ids"][:, :n], prompt["input_ids"]), "Chat prefix mismatch"
         full["labels"] = full["input_ids"].clone()
@@ -138,11 +192,26 @@ def save_model(model, path, processor):
         torch.save(extra, path / "projector.pt")
 
 
+def optimizer_step(params, opt, scaler):
+    """Let GradScaler skip overflowed updates and adapt its scale."""
+    scaler.unscale_(opt)
+    norm = torch.nn.utils.clip_grad_norm_(params, 1.)
+    scale_before = scaler.get_scale()
+    scaler.step(opt)
+    scaler.update()
+    applied = scaler.get_scale() >= scale_before
+    finite = bool(torch.isfinite(norm))
+    if applied and not finite:
+        raise RuntimeError("Nonfinite gradients were not rejected by GradScaler")
+    return applied, float(norm) if finite else None
+
+
 def train(cfg, name, processor):
     random.seed(cfg["seed"])
     torch.manual_seed(cfg["seed"])
     torch.cuda.manual_seed_all(cfg["seed"])
     model = setup(load_base(), cfg)
+    write_json(ROOT / f"report/runs/{name}_setup.json", model._lab_setup_audit)
     dataset = Examples(rows("train"), processor)
     sample = dataset[0]
     image_tokens = int((sample["input_ids"] == model.config.image_token_id).sum())
@@ -169,7 +238,10 @@ def train(cfg, name, processor):
     model.train()
     logs = []
     out = ROOT / f"work/adapters/{name}"
-    for step in range(steps):
+    step = attempts = consecutive_overflows = 0
+    overflow_logs = []
+    while step < steps:
+        attempts += 1
         opt.zero_grad(set_to_none=True)
         loss_sum = 0.
         for _ in range(cfg["grad_accum"]):
@@ -180,30 +252,35 @@ def train(cfg, name, processor):
                 batch = next(it)
             batch = {k: v.to("cuda:0") for k, v in batch.items()}
             with torch.autocast("cuda", dtype=torch.float16):
-                loss = model(**batch).loss
+                loss = model(**batch, use_cache=False).loss
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Nonfinite loss in {name}, step {step+1}")
             loss_sum += loss.item() / cfg["grad_accum"]
             scaler.scale(loss / cfg["grad_accum"]).backward()
-        scaler.unscale_(opt)
-        norm = torch.nn.utils.clip_grad_norm_(params, 1.)
-        if not torch.isfinite(norm):
-            raise RuntimeError(f"Nonfinite gradients in {name}, step {step+1}; reduce LR or inspect fp16")
-        scaler.step(opt)
-        scaler.update()
+        applied, grad_norm = optimizer_step(params, opt, scaler)
+        if not applied:
+            consecutive_overflows += 1
+            overflow_logs.append({"attempt": attempts, "optimizer_steps": step, "amp_scale": scaler.get_scale()})
+            print(f"{name}: AMP overflow; retry step {step+1} at scale {scaler.get_scale()}", flush=True)
+            write_json(ROOT / f"report/runs/{name}_amp_overflows.json", overflow_logs)
+            if consecutive_overflows >= 10:
+                raise RuntimeError(f"Repeated AMP overflows in {name}; inspect loss/dtype or reduce LR")
+            continue
+        consecutive_overflows = 0
         sched.step()
-        logs.append({"step": step+1, "loss": loss_sum, "lr": sched.get_last_lr()[0]})
-        if (step+1) % 10 == 0:
+        step += 1
+        logs.append({"step": step, "attempt": attempts, "loss": loss_sum, "grad_norm": grad_norm, "lr": sched.get_last_lr()[0]})
+        if step % 10 == 0:
             print(name, logs[-1], flush=True)
             write_json(ROOT / f"report/runs/{name}_loss.json", logs)
-        if (step+1) % 100 == 0:
-            save_model(model, out / f"step-{step+1}", processor)
+        if step % 100 == 0:
+            save_model(model, out / f"step-{step}", processor)
     torch.cuda.synchronize()
     meta = {"trainable_params": sum(p.numel() for p in params),
             "peak_vram_gb": torch.cuda.max_memory_allocated() / 1024**3,
             "train_minutes": (time.perf_counter()-start) / 60}
     save_model(model, out / "final", processor)
-    write_json(ROOT / f"report/runs/{name}.json", {**meta, "config": cfg})
+    write_json(ROOT / f"report/runs/{name}.json", {**meta, "config": cfg, "amp_overflows": len(overflow_logs), "optimizer_steps": step})
     write_json(ROOT / f"report/runs/{name}_loss.json", logs)
     del model, opt, params, batch, loss, scaler, sched
     gc.collect()
@@ -236,16 +313,17 @@ def infer(name, split, processor, trained, batch_size=1):
             for entry in group:
                 with Image.open(ROOT / "data" / entry["image_path"]) as im:
                     images.append(im.convert("RGB"))
-            enc = processor.apply_chat_template([messages(im) for im in images], tokenize=True,
-                add_generation_prompt=True, return_dict=True, return_tensors="pt", padding=True).to("cuda:0")
+            enc = encode_chat(processor, [messages(im) for im in images],
+                              add_generation_prompt=True, padding=True).to("cuda:0")
             with torch.autocast("cuda", dtype=torch.float16):
                 outputs = model.generate(**enc, max_new_tokens=512, do_sample=False)
             decoded = processor.batch_decode(outputs[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
             for entry, raw in zip(group, decoded):
                 f.write(json.dumps({"image_id": entry["image_id"], "raw": raw}, ensure_ascii=False)+"\n")
             f.flush()
-            if start % 25 == 0:
-                print(f"{name} {split}: {start}/{len(entries)}", flush=True)
+            completed = start + len(group)
+            if start == 0 or completed % 5 == 0 or completed == len(entries):
+                print(f"{name} {split}: {completed}/{len(entries)} images completed", flush=True)
     del model, enc, outputs
     gc.collect()
     torch.cuda.empty_cache()

@@ -16,7 +16,8 @@ def build_notebook():
 
     cell("markdown", """# Lab Day 10 — Kaggle E0–E4
 Push this implementation to GitHub first, then import this notebook into Kaggle.
-Enable Internet and GPU, attach the road-damage dataset, and grant access to the GITHUB_TOKEN secret.
+Enable Internet and GPU, attach the road-damage dataset, and grant access to GITHUB_TOKEN.
+Optionally enable the HF_TOKEN secret for authenticated Hugging Face downloads.
 Choose **Save Version → Save & Run All**. Each section below contains executable cells.
 Training functions live in `student/pipeline.py`; the notebook calls each step separately and displays its logs.
 E5 is excluded. Complete REPORT.md locally after collecting real results. See KAGGLE.md.
@@ -58,10 +59,11 @@ else:
 os.chdir(REPO)
 sys.path.insert(0, str(REPO))
 assert (REPO / "student/kaggle_runtime.py").exists(), "Push the updated student code to GitHub first"
+from student.kaggle_runtime import configure_hf_token, report_gpu
+HF_AUTH_ENABLED = configure_hf_token(UserSecretsClient(), os.environ)
 subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements-colab.txt", "pytest"], check=True)
 subprocess.run(["nvidia-smi", "-L"], check=True)
 import torch
-from student.kaggle_runtime import report_gpu
 GPU_INFO = report_gpu(torch)  # No hard 15 GiB cutoff: show actual device capacity.
 subprocess.run([sys.executable, "-m", "pytest", "-q", "tests", "student/test_kaggle.py"], check=True)
 print("Preflight passed; result branch:", RESULT_BRANCH)

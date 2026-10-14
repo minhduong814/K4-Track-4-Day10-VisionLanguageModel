@@ -32,6 +32,8 @@ def test_stage_cache_rejects_changed_code_data_or_corrupted_artifact(tmp_path):
     root = fixture_repo(tmp_path)
     completed_e0(root)
     assert reusable_stage(root, "e0")
+    (root / "student/kaggle_runtime.py").write_text("# remove unused old torchao")
+    assert reusable_stage(root, "e0")  # Runtime-only backend cleanup must not discard E0/E1/E2 receipts.
     assert not reusable_stage(root, "e0", batch_size=2)
     prediction = root / "work/e0_test.jsonl"
     prediction.write_text("corrupted")

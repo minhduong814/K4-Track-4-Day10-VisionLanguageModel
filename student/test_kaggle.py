@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from student.kaggle_runtime import configure_hf_token, report_gpu, run_preflight_checks
+from student.kaggle_runtime import configure_hf_token, report_gpu, run_preflight_checks, prepare_optional_backends
 from student.make_notebook import build_notebook
 
 
@@ -38,6 +38,67 @@ def test_small_gpu_warns_but_does_not_abort():
 def test_missing_cuda_has_actionable_error():
     with pytest.raises(RuntimeError, match="Enable a CUDA GPU"):
         report_gpu(fake_torch([]))
+
+
+@pytest.mark.parametrize("version", [None, "0.16.0", "0.18.0"])
+def test_optional_backends_do_not_modify_absent_or_compatible_torchao(version, monkeypatch):
+    from student import kaggle_runtime
+    def detected(name):
+        if version is None:
+            raise kaggle_runtime.importlib.metadata.PackageNotFoundError(name)
+        return version
+    monkeypatch.setattr(kaggle_runtime.importlib.metadata, "version", detected)
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Do not alter core libraries or compatible optional backends")
+    monkeypatch.setattr(kaggle_runtime.subprocess, "run", unexpected)
+    result = prepare_optional_backends()
+    assert result["torchao"] == (version or "not_installed")
+
+
+def test_real_peft_dense_lora_recovers_after_old_torchao_cleanup(monkeypatch):
+    torch = pytest.importorskip("torch")
+    peft = pytest.importorskip("peft")
+    import peft.import_utils as peft_imports
+    from importlib.machinery import ModuleSpec
+    from student import kaggle_runtime
+    original_spec = importlib.util.find_spec
+    original_version = kaggle_runtime.importlib.metadata.version
+    present = [True]
+    def find_spec(name, *args, **kwargs):
+        if name == "torchao":
+            return ModuleSpec(name, loader=None) if present[0] else None
+        return original_spec(name, *args, **kwargs)
+    def version(name):
+        if name == "torchao":
+            if present[0]:
+                return "0.10.0"
+            raise kaggle_runtime.importlib.metadata.PackageNotFoundError(name)
+        return original_version(name)
+    def uninstall(command, **kwargs):
+        assert command == [sys.executable, "-m", "pip", "uninstall", "-y", "torchao"]
+        present[0] = False
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+    monkeypatch.setattr(kaggle_runtime.importlib.metadata, "version", version)
+    monkeypatch.setattr(kaggle_runtime.subprocess, "run", uninstall)
+    config = peft.LoraConfig(r=2, lora_alpha=4, target_modules=["qkv"])
+    class VisionLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = torch.nn.Linear(8, 8)
+        def forward(self, x):
+            return self.qkv(x)
+    peft_imports.is_torchao_available.cache_clear()
+    try:
+        with pytest.raises(ImportError, match="incompatible version of torchao"):
+            peft.get_peft_model(VisionLayer(), config)
+        assert prepare_optional_backends()["action"] == "removed_incompatible_optional_backend"
+        model = peft.get_peft_model(VisionLayer(), config)
+        model(torch.randn(2, 8)).sum().backward()
+        gradients = [p.grad for n, p in model.named_parameters() if "lora_B" in n]
+        assert gradients and all(g is not None and torch.isfinite(g).all() for g in gradients)
+    finally:
+        peft_imports.is_torchao_available.cache_clear()
 
 
 def test_preflight_preserves_failure_details_and_notebook_sync_hint(tmp_path, monkeypatch):

@@ -39,16 +39,23 @@ Nếu gặp `Attempting to unscale FP16 gradients`, cập nhật `student/pipeli
 
 Nếu GradScaler gặp overflow khi hiệu chỉnh scale ban đầu, nó bỏ qua update và giảm scale; scheduler và bộ đếm 300 bước chỉ tăng khi optimizer thực sự update. Log riêng `report/runs/<setup>_amp_overflows.json` ghi lại các lần này; code dừng nếu có 10 overflow liên tiếp. Loss NaN/Inf vẫn dừng ngay để tránh tiếp tục train sai.
 
+Nếu E3 báo `Found an incompatible version of torchao ... 0.10.0 ... 0.16.0`, đây là backend tuỳ chọn có sẵn trên Kaggle. Lab dùng bitsandbytes, nhưng PEFT vẫn kiểm tra TorchAO khi gắn LoRA vào các lớp dense của ViT. Setup mới tự gỡ TorchAO nếu phiên bản dưới 0.16.0, không nâng cấp torch/PEFT/bitsandbytes. Thông tin được ghi ở `report/runs/optional_backends.json`. Thay đổi này chỉ ở runtime/notebook, giữ nguyên fingerprint pipeline để reuse E0/E1/E2 đúng đã chạy.
+
+Nếu **phiên hiện tại vẫn còn `/kaggle/working/lab-repo`**, chạy ngay cell sau, không cần restart kernel hoặc train lại E1/E2:
+
+```python
+subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=True)
+pipeline_error = None
+run_stage("train", "e3")
+```
+
+E3 bị lỗi trước khi gắn xong LoRA nên chưa có optimizer step để tiếp tục; chỉ riêng E3 bắt đầu train từ đầu. Sau khi E3 xong, chạy các cell từ mục 7 (evaluate E1/E2/E3), rồi mục 8 (E4/summary/push). Những bước đã có receipt hợp lệ sẽ tự `REUSE`. Nếu đã sang session mới, attach Output cũ và đặt `RESUME_FROM` như phần trên, dùng notebook mới có bước xử lý TorchAO. Giữ cùng các phiên bản torch/transformers/PEFT/bitsandbytes/accelerate và cấu hình batch để cache E1/E2 còn hợp lệ.
+
 Nếu E2 báo `only Tensors of floating point and complex dtype can require gradients`, projector có thể vẫn là trọng số đóng gói 4-bit. Với Transformers 5.19, skip list phải dùng đường dẫn đầy đủ `['model.visual', 'lm_head']`; tên ngắn `visual` không loại được các lớp `model.visual.*`. `load_base()` mới kiểm tra ngay rằng toàn bộ ViT/projector và lm_head không bị lượng tử hóa, trong khi LLM có Params4bit. Kiểm tra này chạy cả ở E0, trước khi mất thời gian train. Audit setup ghi cả cấu hình lượng tử hóa. Không ép `.float()` trực tiếp lên packed 4-bit weights để thay thế việc load đúng. Vì sửa này thay cấu hình load model, chạy lại toàn bộ E0–E4 trong một Save & Run All mới để kết quả so sánh nhất quán; không ghép evidence E0/E1 từ cấu hình load cũ với E2/E3 từ cấu hình mới.
 
-Adapter, projector checkpoints và predictions nằm trong `/kaggle/working/lab-repo/work/`, được giữ trong Kaggle Output và không push GitHub. Repo clone có metadata split trong `data/`; metadata cũng được sao chép sang `report/runs/splits.json`. Cache tải model đặt ở `/tmp` để giảm dung lượng Output. Nếu Kaggle kill session vì hết thời gian/VRAM, cell cleanup có thể không chạy; không có đảm bảo một lần chạy sẽ thành công trước khi kiểm tra trên GPU thật.
+Adapter, projector checkpoints và predictions nằm trong `/kaggle/working/lab-repo/work/`, được giữ trong Kaggle Output và không push GitHub. Repo clone có metadata split trong `data/`; metadata cũng được sao chép sang `report/runs/splits.json`. Cache tải model đặt ở `/tmp` để giảm dung lượng Output. Nếu Kaggle kill session vì hết thời gian/VRAM, cell cleanup có thể không chạy; không có đảm bảo một lần chạy sẽ thành công trước khi kiểm 
 
-Sau khi chạy, lấy tên branch trong output và ở local:
-
-```powershell
-git fetch origin
-git merge origin/kaggle-results-YYYYMMDD-HHMMSS
-```
+``
 
 Tải dataset ở local bằng công cụ gốc nếu cần chạy submission checker. Dùng `report/RESULTS.md`, `report/summary.json`, `report/runs/`, `report/figures/` để hoàn thiện `REPORT.md`, rồi chạy `python scripts/check_submission.py`.
 

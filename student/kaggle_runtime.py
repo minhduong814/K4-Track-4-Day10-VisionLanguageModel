@@ -2,6 +2,8 @@
 import subprocess
 import sys
 import warnings
+import importlib
+import importlib.metadata
 from pathlib import Path
 
 
@@ -20,6 +22,21 @@ def configure_hf_token(secrets, environ):
           "HF_TOKEN not configured; public model downloads will be unauthenticated. "
           "To authenticate, enable the HF_TOKEN secret in Kaggle Add-ons > Secrets.")
     return enabled
+
+
+def prepare_optional_backends():
+    """Remove old, unused TorchAO that PEFT probes while adapting dense ViT layers."""
+    try:
+        installed = importlib.metadata.version("torchao")
+    except importlib.metadata.PackageNotFoundError:
+        return {"torchao": "not_installed"}
+    from packaging.version import Version
+    if Version(installed) >= Version("0.16.0"):
+        return {"torchao": installed, "action": "unchanged"}
+    print(f"Removing unused torchao {installed}: PEFT 0.21.2 requires >=0.16.0 when probing this backend.", flush=True)
+    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=True)
+    importlib.invalidate_caches()
+    return {"torchao": installed, "action": "removed_incompatible_optional_backend", "quantization_backend": "bitsandbytes"}
 
 
 def run_preflight_checks(repo):

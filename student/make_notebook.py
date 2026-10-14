@@ -61,12 +61,15 @@ else:
 os.chdir(REPO)
 sys.path.insert(0, str(REPO))
 assert (REPO / "student/kaggle_runtime.py").exists(), "Push the updated student code to GitHub first"
-from student.kaggle_runtime import configure_hf_token, report_gpu, run_preflight_checks
+from student.kaggle_runtime import configure_hf_token, report_gpu, run_preflight_checks, prepare_optional_backends
 from student.resume import restore_output, reusable_stage, record_stage
 if RESUME_FROM:
     restore_output(REPO, RESUME_FROM)
 HF_AUTH_ENABLED = configure_hf_token(UserSecretsClient(), os.environ)
 subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements-colab.txt", "pytest"], check=True)
+BACKEND_INFO = prepare_optional_backends()
+(REPO / "report/runs").mkdir(parents=True, exist_ok=True)
+(REPO / "report/runs/optional_backends.json").write_text(json.dumps(BACKEND_INFO, indent=2), encoding="utf-8")
 subprocess.run(["nvidia-smi", "-L"], check=True)
 import torch
 GPU_INFO = report_gpu(torch)  # No hard 15 GiB cutoff: show actual device capacity.

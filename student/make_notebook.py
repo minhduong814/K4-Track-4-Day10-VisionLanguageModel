@@ -33,6 +33,8 @@ SOURCE_REF = "main"
 RESULT_BRANCH = "kaggle-results-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 REPO = Path("/kaggle/working/lab-repo")
 BATCH_SIZE, GRAD_ACCUM = 1, 8
+RESUME_FROM = None  # e.g. "/kaggle/input/previous-notebook-output/lab-repo"
+FAIL_VERSION_ON_ERROR = False  # Keep partial Output when a stage fails; status.json still says failed.
 GITHUB_TOKEN = UserSecretsClient().get_secret("GITHUB_TOKEN")
 request = urllib.request.Request("https://api.github.com/repos/minhduong814/K4-Track-4-Day10-VisionLanguageModel",
     headers={"Authorization": "Bearer " + GITHUB_TOKEN, "Accept": "application/vnd.github+json"})
@@ -60,16 +62,19 @@ os.chdir(REPO)
 sys.path.insert(0, str(REPO))
 assert (REPO / "student/kaggle_runtime.py").exists(), "Push the updated student code to GitHub first"
 from student.kaggle_runtime import configure_hf_token, report_gpu
+from student.resume import restore_output, reusable_stage, record_stage
+if RESUME_FROM:
+    restore_output(REPO, RESUME_FROM)
 HF_AUTH_ENABLED = configure_hf_token(UserSecretsClient(), os.environ)
 subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements-colab.txt", "pytest"], check=True)
 subprocess.run(["nvidia-smi", "-L"], check=True)
 import torch
 GPU_INFO = report_gpu(torch)  # No hard 15 GiB cutoff: show actual device capacity.
-subprocess.run([sys.executable, "-m", "pytest", "-q", "tests", "student/test_kaggle.py"], check=True)
+subprocess.run([sys.executable, "-m", "pytest", "-q", "tests", "student/test_kaggle.py", "student/test_resume.py"], check=True)
 print("Preflight passed; result branch:", RESULT_BRANCH)
 ''')
     cell("code", '''# Each subprocess owns and releases its CUDA model; failures skip later experiments.
-# The final cell still attempts to push partial artifacts, then re-raises the failure.
+# The final cell preserves partial Output and prominently reports failure status.
 pipeline_error = None
 stage_history = []
 
@@ -87,6 +92,10 @@ def run_stage(stage, name=None):
     folder.mkdir(parents=True, exist_ok=True)
     print(f"\\n===== START {label} =====", flush=True)
     try:
+        if reusable_stage(REPO, stage, name, BATCH_SIZE, GRAD_ACCUM):
+            stage_history.append({"stage": label, "status": "reused"})
+            print(f"REUSE {label}: matching code/config/data and verified artifacts", flush=True)
+            return True
         with (folder / f"{label}.log.txt").open("w", encoding="utf-8") as log:
             process = subprocess.Popen(command, cwd=REPO, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -97,6 +106,7 @@ def run_stage(stage, name=None):
             code = process.wait()
         if code:
             raise RuntimeError(f"{label} exited {code}; see report/runs/{label}.log.txt")
+        record_stage(REPO, stage, name, BATCH_SIZE, GRAD_ACCUM)
         stage_history.append({"stage": label, "status": "completed"})
         print(f"===== DONE {label} =====", flush=True)
         return True
@@ -126,7 +136,7 @@ print(json.dumps(split_meta["counts"], indent=2))
     cell("code", 'run_stage("mask")')
     cell("markdown", "## 5. Configure E1/E2/E3 and inspect LoRA targets\nE1: LLM LoRA. E2: add full fp32 projector training. E3: add ViT LoRA. Training asserts 252/348 matched modules.")
     cell("code", 'run_stage("configs")')
-    cell("markdown", "## 6. Train E1, E2 and E3\nEach cell runs 300 optimizer steps, batch 1 × accumulation 8, warmup/cosine, checkpointing and finite loss/gradient checks. Each fresh base model starts with seed 42. Save LoRA adapters plus full projector weights for E2/E3.")
+    cell("markdown", "## 6. Train E1, E2 and E3\nEach cell runs 300 optimizer steps, batch 1 × accumulation 8, warmup/cosine and finite loss/gradient checks. Save resumable optimizer/model/RNG/batch checkpoints every 50 successful steps. Compatible completed setups are reused; interrupted training resumes at its last complete checkpoint. Final artifacts contain LoRA plus full projector weights for E2/E3.")
     for name in ("e1", "e2", "e3"):
         cell("code", f'# Train {name.upper()} and record real VRAM/time/loss.\nrun_stage("train", "{name}")')
     cell("markdown", "## 7. Reload adapters/projectors, infer and score E1–E3\nEach setup is evaluated on val and test. E4 base selection uses val only. Evidence uses the unmodified scripts/score.py.")
@@ -143,6 +153,8 @@ print(json.dumps(split_meta["counts"], indent=2))
 ''')
     cell("code", '''# Push only report artifacts. Weights, data and secrets stay out of GitHub.
 from student.github_sync import push_results
+if not GITHUB_TOKEN:
+    GITHUB_TOKEN = UserSecretsClient().get_secret("GITHUB_TOKEN")
 push_error = None
 try:
     push_results(REPO, GITHUB_TOKEN, RESULT_BRANCH)
@@ -152,10 +164,17 @@ except Exception as exc:
 finally:
     GITHUB_TOKEN = None
 if pipeline_error is not None:
-    raise pipeline_error
-if push_error is not None:
-    raise push_error
-print("Completed. Pull branch", RESULT_BRANCH, "at local to finish REPORT.md.")
+    print("PIPELINE FAILED:", pipeline_error)
+    print("Partial results/checkpoints are kept in Kaggle Output. Attach this Output as Input in the next version and set RESUME_FROM.")
+elif push_error is not None:
+    print("Pipeline finished; GITHUB PUSH FAILED. Download report/ from Kaggle Output.")
+else:
+    print("Completed. Pull branch", RESULT_BRANCH, "at local to finish REPORT.md.")
+if FAIL_VERSION_ON_ERROR:
+    if pipeline_error is not None:
+        raise pipeline_error
+    if push_error is not None:
+        raise push_error
 ''')
     return {"cells": cells, "metadata": {"accelerator": "GPU",
             "kernelspec": {"name": "python3", "display_name": "Python 3", "language": "python"},

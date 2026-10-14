@@ -14,17 +14,21 @@ from pathlib import Path
 import torch
 import yaml
 from PIL import Image, ImageDraw
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLForConditionalGeneration
 from peft import LoraConfig, PeftModel, get_peft_model
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.score import evaluate, parse_output
+from student.resume import (BatchStream, atomic_json, compatible_checkpoint, digest,
+                            prune_checkpoints, record_stage, reusable_stage, stage_signature)
 
 MODEL = "Qwen/Qwen3-VL-4B-Instruct"
 LLM_TARGETS = r"model\.language_model\.layers\.\d+\.(?:self_attn\.(?:q|k|v|o)_proj|mlp\.(?:gate|up|down)_proj)"
 VIT_TARGETS = r"model\.visual\.blocks\.\d+\.(?:attn\.(?:qkv|proj)|mlp\.(?:linear_fc1|linear_fc2))"
+# transformers 5.19 matches full paths/prefixes, not arbitrary path components.
+QUANTIZATION_SKIP_MODULES = ["model.visual", "lm_head"]
 PROMPT = ('Detect all potholes, cracks and manholes. Return only a JSON list of objects '
           'with keys "label" (pothole, crack, manhole) and "bbox_2d" '
           '([x1,y1,x2,y2], integer coordinates normalized to 0–1000). '
@@ -67,14 +71,49 @@ def encode_chat(processor, conversation, *, add_generation_prompt, padding=False
 def load_base():
     quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                               bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True,
-                              llm_int8_skip_modules=["visual", "lm_head"])
-    return Qwen3VLForConditionalGeneration.from_pretrained(
+                              llm_int8_skip_modules=QUANTIZATION_SKIP_MODULES)
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
         MODEL, quantization_config=quant, dtype=torch.float16,
         device_map={"": 0}, attn_implementation="sdpa")
+    model._lab_quantization_audit = validate_quantization(model)
+    print("Quantization verified:", json.dumps(model._lab_quantization_audit), flush=True)
+    return model
 
 
 def projector(name):
     return "visual.merger." in name or "visual.deepstack_merger_list." in name
+
+
+def quantized_parameter(param):
+    return type(param).__name__ in ("Params4bit", "Int8Params") or getattr(param, "quant_state", None) is not None
+
+
+def validate_quantization(model):
+    """Reject a quantized vision tower/projector before any setup can train it."""
+    vision_params = projector_params = nf4_llm_weights = 0
+    invalid = []
+    for name, param in model.named_parameters():
+        if name.startswith("model.visual.") or name.startswith("lm_head."):
+            if quantized_parameter(param) or not param.is_floating_point():
+                invalid.append(f"{name}: {type(param).__name__}, {param.dtype}")
+            if name.startswith("model.visual."):
+                vision_params += param.numel()
+                if projector(name):
+                    projector_params += param.numel()
+        elif name.startswith("model.language_model.") and type(param).__name__ == "Params4bit":
+            nf4_llm_weights += 1
+    # A tied lm_head may be omitted from named_parameters; inspect its module too.
+    for name, module in model.named_modules():
+        if name == "lm_head" and (type(module).__name__ in ("Linear4bit", "Linear8bitLt") or
+                                 quantized_parameter(getattr(module, "weight", None))):
+            invalid.append(f"lm_head: {type(module).__name__}")
+    if invalid:
+        raise RuntimeError("Vision/projector/lm_head must not be quantized. "
+                           "Use llm_int8_skip_modules=['model.visual', 'lm_head']. Invalid: " + "; ".join(invalid[:8]))
+    if not vision_params or not projector_params or not nf4_llm_weights:
+        raise RuntimeError("Unexpected NF4 model layout: need floating vision/projector and 4-bit LLM weights")
+    return {"skip_modules": QUANTIZATION_SKIP_MODULES, "vision_params": vision_params,
+            "projector_params": projector_params, "nf4_llm_weights": nf4_llm_weights}
 
 
 def trainable_group(name, cfg):
@@ -102,16 +141,19 @@ def finalize_trainable_parameters(model, cfg):
         group = trainable_group(name, cfg)
         if param.requires_grad and group is None:
             audit["refrozen"].append(name)
-        param.requires_grad = group is not None
         if group is None:
+            param.requires_grad = False
             continue
-        if not param.is_floating_point():
-            raise RuntimeError(f"Trainable parameter is quantized/nonfloating: {name}")
+        # Validate before enabling gradients: packed Params4bit can be uint8.
+        if quantized_parameter(param) or not param.is_floating_point():
+            raise RuntimeError(f"Trainable parameter is quantized/nonfloating: {name}: "
+                               f"{type(param).__name__}, {param.dtype}. Reload with model.visual excluded from NF4.")
         if param.dtype != torch.float32:
             param.data = param.data.float()
             audit["promoted_to_fp32"].append(name)
         if param.dtype != torch.float32:
             raise RuntimeError(f"AMP optimizer parameter must be fp32: {name}: {param.dtype}")
+        param.requires_grad = True
         groups[group] += param.numel()
         audit["parameters"].append({"name": name, "group": group, "dtype": str(param.dtype), "numel": param.numel()})
     if not groups["llm_lora"]:
@@ -128,6 +170,7 @@ def finalize_trainable_parameters(model, cfg):
 
 
 def setup(model, cfg):
+    quantization_audit = getattr(model, "_lab_quantization_audit", None)
     for p in model.parameters():
         p.requires_grad = False
     regex = LLM_TARGETS if cfg["lora"]["targets"] == "llm" else f"(?:{LLM_TARGETS}|{VIT_TARGETS})"
@@ -143,6 +186,7 @@ def setup(model, cfg):
     model.config.text_config.use_cache = False
     model._lab_setup_audit = finalize_trainable_parameters(model, cfg)
     model._lab_setup_audit["matched_modules"] = matched
+    model._lab_setup_audit["quantization"] = quantization_audit
     model.print_trainable_parameters()
     return model
 
@@ -207,6 +251,13 @@ def optimizer_step(params, opt, scaler):
 
 
 def train(cfg, name, processor):
+    signature = stage_signature(ROOT, "train", name, cfg["batch_size"], cfg["grad_accum"])
+    if reusable_stage(ROOT, "train", name, cfg["batch_size"], cfg["grad_accum"]):
+        run = json.loads((ROOT / f"report/runs/{name}.json").read_text(encoding="utf-8"))
+        print(f"REUSE completed training: {name}", flush=True)
+        return {k: run[k] for k in ("trainable_params", "peak_vram_gb", "train_minutes")}
+    out = ROOT / f"work/adapters/{name}"
+    checkpoint = compatible_checkpoint(out, signature)
     random.seed(cfg["seed"])
     torch.manual_seed(cfg["seed"])
     torch.cuda.manual_seed_all(cfg["seed"])
@@ -220,8 +271,10 @@ def train(cfg, name, processor):
         "image_tokens": image_tokens,
         "supervised_text": processor.tokenizer.decode(sample["labels"][sample["labels"] != -100]),
         "config": cfg})
-    loader = DataLoader(dataset, batch_size=cfg["batch_size"], shuffle=True, num_workers=0,
-                        collate_fn=lambda b: collate(b, processor.tokenizer.pad_token_id))
+    order_generator = torch.Generator().manual_seed(cfg["seed"])
+    stream = BatchStream(dataset, cfg["batch_size"],
+                        lambda b: collate(b, processor.tokenizer.pad_token_id),
+                        lambda: torch.randperm(len(dataset), generator=order_generator).tolist())
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=float(cfg["lr"]), weight_decay=0)
     steps = cfg["max_steps"]
@@ -232,24 +285,64 @@ def train(cfg, name, processor):
         return .5 * (1 + math.cos(math.pi * (step-warmup) / max(1, steps-warmup)))
     sched = torch.optim.lr_scheduler.LambdaLR(opt, schedule)
     scaler = torch.amp.GradScaler("cuda")
-    torch.cuda.reset_peak_memory_stats()
-    start = time.perf_counter()
-    it = iter(loader)
     model.train()
     logs = []
-    out = ROOT / f"work/adapters/{name}"
     step = attempts = consecutive_overflows = 0
     overflow_logs = []
+    previous_seconds = previous_peak = 0.
+    if checkpoint:
+        _, folder, checkpoint_meta = checkpoint
+        state = torch.load(folder / "trainer.pt", map_location="cpu", weights_only=True)
+        current = {n: p for n, p in model.named_parameters() if p.requires_grad}
+        if set(current) != set(state["trainable_weights"]):
+            raise RuntimeError("Checkpoint trainable parameter names differ from the current setup")
+        with torch.no_grad():
+            for n, p in current.items():
+                p.copy_(state["trainable_weights"][n])
+        opt.load_state_dict(state["optimizer"])
+        sched.load_state_dict(state["scheduler"])
+        scaler.load_state_dict(state["scaler"])
+        stream.load_state_dict(state["batches"])
+        order_generator.set_state(state["order_rng"])
+        random.setstate(state["python_rng"])
+        torch.set_rng_state(state["torch_rng"])
+        torch.cuda.set_rng_state(state["cuda_rng"], 0)
+        step, attempts = state["step"], state["attempts"]
+        logs, overflow_logs = state["logs"], state["overflow_logs"]
+        previous_seconds = checkpoint_meta["train_seconds"]
+        previous_peak = checkpoint_meta["peak_vram_gb"]
+        del state, current
+        print(f"RESUME {name}: optimizer step {step}/{steps}; next batch cursor {stream.cursor}", flush=True)
+    torch.cuda.reset_peak_memory_stats()
+    start = time.perf_counter()
+    batch = loss = None  # A step-300 checkpoint can resume directly into final saving.
+
+    def save_checkpoint():
+        torch.cuda.synchronize()
+        folder = out / f"resume-step-{step}"
+        folder.mkdir(parents=True, exist_ok=True)
+        state = {
+            "trainable_weights": {n: p.detach().cpu() for n, p in model.named_parameters() if p.requires_grad},
+            "optimizer": opt.state_dict(), "scheduler": sched.state_dict(), "scaler": scaler.state_dict(),
+            "step": step, "attempts": attempts, "logs": logs, "overflow_logs": overflow_logs,
+            "batches": stream.state_dict(), "order_rng": order_generator.get_state(),
+            "python_rng": random.getstate(), "torch_rng": torch.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state(0)}
+        tmp = folder / "trainer.pt.tmp"
+        torch.save(state, tmp)
+        tmp.replace(folder / "trainer.pt")
+        checksum = digest(folder / "trainer.pt")
+        atomic_json(folder / "checkpoint.json", {"signature": signature, "step": step, "sha256": checksum,
+                    "train_seconds": previous_seconds + time.perf_counter()-start,
+                    "peak_vram_gb": max(previous_peak, torch.cuda.max_memory_allocated()/1024**3)})
+        prune_checkpoints(out, keep=2)
+        print(f"Saved resumable checkpoint {name}: step {step}", flush=True)
+
     while step < steps:
         attempts += 1
         opt.zero_grad(set_to_none=True)
         loss_sum = 0.
         for _ in range(cfg["grad_accum"]):
-            try:
-                batch = next(it)
-            except StopIteration:
-                it = iter(loader)
-                batch = next(it)
+            batch = next(stream)
             batch = {k: v.to("cuda:0") for k, v in batch.items()}
             with torch.autocast("cuda", dtype=torch.float16):
                 loss = model(**batch, use_cache=False).loss
@@ -273,15 +366,17 @@ def train(cfg, name, processor):
         if step % 10 == 0:
             print(name, logs[-1], flush=True)
             write_json(ROOT / f"report/runs/{name}_loss.json", logs)
-        if step % 100 == 0:
-            save_model(model, out / f"step-{step}", processor)
+        if step % 50 == 0:
+            save_checkpoint()
     torch.cuda.synchronize()
     meta = {"trainable_params": sum(p.numel() for p in params),
-            "peak_vram_gb": torch.cuda.max_memory_allocated() / 1024**3,
-            "train_minutes": (time.perf_counter()-start) / 60}
+            "peak_vram_gb": max(previous_peak, torch.cuda.max_memory_allocated() / 1024**3),
+            "train_minutes": (previous_seconds + time.perf_counter()-start) / 60}
     save_model(model, out / "final", processor)
     write_json(ROOT / f"report/runs/{name}.json", {**meta, "config": cfg, "amp_overflows": len(overflow_logs), "optimizer_steps": step})
     write_json(ROOT / f"report/runs/{name}_loss.json", logs)
+    record_stage(ROOT, "train", name, cfg["batch_size"], cfg["grad_accum"])
+    prune_checkpoints(out, keep=0)  # Final adapter/projector and receipts now preserve this completed run.
     del model, opt, params, batch, loss, scaler, sched
     gc.collect()
     torch.cuda.empty_cache()

@@ -21,7 +21,9 @@ def push_results(repo, token, branch):
         def git(*args, check=True):
             return subprocess.run(["git", "-c", "credential.helper=", *args], cwd=repo,
                                   env=env, check=check, capture_output=True, text=True)
-        git("checkout", "-b", branch)
+        current = git("branch", "--show-current").stdout.strip()
+        if current != branch:
+            git("checkout", "-b", branch)
         git("config", "user.name", "Kaggle experiment runner")
         git("config", "user.email", "minhduong814@users.noreply.github.com")
         allowed = []
@@ -33,7 +35,8 @@ def push_results(repo, token, branch):
         if not allowed:
             raise RuntimeError("No report artifacts to push")
         git("add", "--", *allowed)
-        git("commit", "-m", "Save Kaggle E0–E4 experiment evidence and report artifacts")
+        if git("diff", "--cached", "--quiet", check=False).returncode:
+            git("commit", "-m", "Save Kaggle E0–E4 experiment evidence and report artifacts")
         result = git("push", "origin", f"HEAD:refs/heads/{branch}", check=False)
         if result.returncode:
             # Do not print authentication diagnostics into notebook output.

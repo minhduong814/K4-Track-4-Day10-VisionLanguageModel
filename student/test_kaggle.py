@@ -3,6 +3,7 @@ import argparse
 import ast
 import copy
 import json
+import importlib.util
 import re
 import sys
 from pathlib import Path
@@ -88,7 +89,8 @@ def test_failed_stage_skips_later_training_and_pushes_partial_results(tmp_path, 
         commands.append(command)
         return SimpleNamespace(stdout=iter(["CUDA out of memory\n"]), wait=lambda: 1)
     ns = dict(REPO=tmp_path, BATCH_SIZE=1, GRAD_ACCUM=8, sys=sys, json=json,
-              subprocess=SimpleNamespace(Popen=popen, PIPE=-1, STDOUT=-2))
+              subprocess=SimpleNamespace(Popen=popen, PIPE=-1, STDOUT=-2),
+              reusable_stage=lambda *args: False, record_stage=lambda *args: None)
     exec(runner, ns)
     assert not ns["run_stage"]("train", "e2")
     assert not ns["run_stage"]("train", "e3")
@@ -98,10 +100,13 @@ def test_failed_stage_skips_later_training_and_pushes_partial_results(tmp_path, 
     from student import github_sync
     pushed = []
     monkeypatch.setattr(github_sync, "push_results", lambda *args: pushed.append(args))
-    ns.update(GITHUB_TOKEN="test-only-placeholder", RESULT_BRANCH="kaggle-results-test")
+    ns.update(GITHUB_TOKEN="test-only-placeholder", RESULT_BRANCH="kaggle-results-test", FAIL_VERSION_ON_ERROR=True)
     with pytest.raises(RuntimeError, match="train_e2 exited 1"):
         exec("".join(cells[-1]["source"]), ns)
     assert len(pushed) == 1 and ns["GITHUB_TOKEN"] is None
+    ns.update(GITHUB_TOKEN="test-only-placeholder", FAIL_VERSION_ON_ERROR=False)
+    exec("".join(cells[-1]["source"]), ns)
+    assert len(pushed) == 2  # Preserve Output without pretending the pipeline completed.
 
 
 def load_pipeline_functions(names, namespace):
@@ -116,9 +121,20 @@ def load_pipeline_functions(names, namespace):
 
 class FakeParameter:
     def __init__(self, size, dtype="torch.float16", requires_grad=True):
-        self.size, self.requires_grad = size, requires_grad
+        self.size = size
         self.data = SimpleNamespace(dtype=dtype)
         self.data.float = lambda: SimpleNamespace(dtype="torch.float32")
+        self.requires_grad = requires_grad
+
+    @property
+    def requires_grad(self):
+        return self._requires_grad
+
+    @requires_grad.setter
+    def requires_grad(self, enabled):
+        if enabled and not self.is_floating_point():
+            raise RuntimeError("only Tensors of floating point and complex dtype can require gradients")
+        self._requires_grad = enabled
 
     @property
     def dtype(self):
@@ -153,7 +169,7 @@ def parameter_fixture():
 ])
 def test_setup_refreezes_unintended_params_and_promotes_all_trainables_after_checkpointing(targets, projector_enabled, expected):
     params = parameter_fixture()
-    ns = load_pipeline_functions({"LLM_TARGETS", "VIT_TARGETS", "trainable_group", "finalize_trainable_parameters", "setup"},
+    ns = load_pipeline_functions({"LLM_TARGETS", "VIT_TARGETS", "quantized_parameter", "trainable_group", "finalize_trainable_parameters", "setup"},
         dict(re=re, json=json, torch=SimpleNamespace(float32="torch.float32"), LoraConfig=lambda **kw: kw))
     module_names = [f"model.language_model.layers.{i}.{kind}.{proj}" for i in range(36)
                     for kind, projections in [("self_attn", ["q_proj", "k_proj", "v_proj", "o_proj"]),
@@ -187,8 +203,8 @@ def test_setup_refreezes_unintended_params_and_promotes_all_trainables_after_che
 def test_quantized_trainable_parameter_fails_before_optimizer():
     params = parameter_fixture()
     first = next(iter(params))
-    params[first] = FakeParameter(20, "torch.uint8")
-    ns = load_pipeline_functions({"LLM_TARGETS", "VIT_TARGETS", "trainable_group", "finalize_trainable_parameters"},
+    params[first] = FakeParameter(20, "torch.uint8", False)
+    ns = load_pipeline_functions({"LLM_TARGETS", "VIT_TARGETS", "quantized_parameter", "trainable_group", "finalize_trainable_parameters"},
                                 dict(re=re, json=json, torch=SimpleNamespace(float32="torch.float32")))
     with pytest.raises(RuntimeError, match="quantized/nonfloating"):
         ns["finalize_trainable_parameters"](SimpleNamespace(named_parameters=lambda: params.items()),
@@ -199,7 +215,7 @@ def test_real_cpu_grad_scaler_accepts_finalized_parameters():
     # Runs on Kaggle's installed torch too; no GPU or model download needed.
     torch = pytest.importorskip("torch")
     cfg = {"train_projector": True, "lora": {"targets": "llm"}}
-    ns = load_pipeline_functions({"LLM_TARGETS", "VIT_TARGETS", "trainable_group", "finalize_trainable_parameters", "optimizer_step"},
+    ns = load_pipeline_functions({"LLM_TARGETS", "VIT_TARGETS", "quantized_parameter", "trainable_group", "finalize_trainable_parameters", "optimizer_step"},
                                 dict(re=re, json=json, torch=torch))
     params = {
         "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.default.weight": torch.nn.Parameter(torch.ones(2, dtype=torch.float16)),
@@ -231,6 +247,99 @@ def test_real_cpu_grad_scaler_accepts_finalized_parameters():
     applied, norm = ns["optimizer_step"](trainables, opt, scaler)
     assert not applied and norm is None and scaler.get_scale() < old_scale
     assert torch.equal(trainables[0], before)
+
+
+def load_upstream_skip_matcher():
+    # Test the pinned library's real source without importing its heavy dependencies.
+    spec = importlib.util.find_spec("transformers")
+    if spec is None:
+        pytest.skip("Transformers source is not installed")
+    source = Path(spec.origin).parent / "quantizers/quantizers_utils.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    selected = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "should_convert_module"]
+    ns = {"re": re}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(source), "exec"), ns)
+    return ns["should_convert_module"]
+
+
+def test_nf4_exclusions_match_actual_transformers_full_paths():
+    should_convert = load_upstream_skip_matcher()
+    ns = load_pipeline_functions({"QUANTIZATION_SKIP_MODULES"}, {})
+    skip = ns["QUANTIZATION_SKIP_MODULES"]
+    protected = ["model.visual.blocks.0.attn.qkv", "model.visual.blocks.23.mlp.linear_fc2",
+                 "model.visual.merger.linear_fc1", "model.visual.deepstack_merger_list.0.linear_fc2", "lm_head"]
+    for name in protected:
+        assert not should_convert(name, skip), name
+    assert should_convert("model.language_model.layers.0.self_attn.q_proj", skip)
+    assert should_convert("model.visual.merger.linear_fc1", ["visual", "lm_head"]), "Reproduce the old skip-list bug"
+
+
+class Params4bit(FakeParameter):
+    """Represent a packed bnb parameter, including its possible floating storage dtype."""
+
+
+def test_model_load_rejects_quantized_projector_before_setup():
+    params = {"model.visual.merger.linear_fc1.weight": Params4bit(50, "torch.uint8", False),
+              "model.visual.blocks.0.attn.qkv.weight": FakeParameter(100),
+              "model.language_model.layers.0.self_attn.q_proj.weight": Params4bit(50, "torch.uint8", False)}
+    ns = load_pipeline_functions({"QUANTIZATION_SKIP_MODULES", "projector", "quantized_parameter", "validate_quantization"}, {})
+    model = SimpleNamespace(named_parameters=lambda: params.items(), named_modules=lambda: [])
+    with pytest.raises(RuntimeError, match="model.visual.merger.linear_fc1.weight"):
+        ns["validate_quantization"](model)
+    params["model.visual.merger.linear_fc1.weight"] = FakeParameter(200)
+    audit = ns["validate_quantization"](model)
+    assert audit["vision_params"] == 300 and audit["projector_params"] == 200 and audit["nf4_llm_weights"] == 1
+    # Even floating-storage bnb parameters must not be trained as dense projectors.
+    params["model.visual.merger.linear_fc1.weight"] = Params4bit(200, "torch.float16", False)
+    with pytest.raises(RuntimeError, match="must not be quantized"):
+        ns["validate_quantization"](model)
+
+
+def test_quantized_projector_is_rejected_before_enabling_gradients():
+    params = parameter_fixture()
+    name = "base_model.model.model.visual.merger.linear_fc1.weight"
+    packed = Params4bit(50, "torch.uint8", False)
+    params[name] = packed
+    ns = load_pipeline_functions({"LLM_TARGETS", "VIT_TARGETS", "quantized_parameter", "trainable_group", "finalize_trainable_parameters"},
+                                dict(re=re, json=json, torch=SimpleNamespace(float32="torch.float32")))
+    with pytest.raises(RuntimeError, match="quantized/nonfloating.*visual.merger"):
+        ns["finalize_trainable_parameters"](SimpleNamespace(named_parameters=lambda: params.items()),
+                                           {"train_projector": True, "lora": {"targets": "llm"}})
+    assert not packed.requires_grad
+
+
+def test_actual_bnb_conversion_keeps_vision_dense():
+    torch = pytest.importorskip("torch")
+    bnb = pytest.importorskip("bitsandbytes")
+    from transformers import BitsAndBytesConfig
+    from transformers.integrations.bitsandbytes import replace_with_bnb_linear
+
+    def tiny_model():
+        model = torch.nn.Module()
+        model.model = torch.nn.Module()
+        model.model.visual = torch.nn.Module()
+        model.model.visual.merger = torch.nn.Sequential(torch.nn.Linear(4, 4))
+        model.model.visual.deepstack_merger_list = torch.nn.ModuleList([torch.nn.Linear(4, 4)])
+        model.model.visual.blocks = torch.nn.ModuleList([torch.nn.Sequential(torch.nn.Linear(4, 4))])
+        model.model.language_model = torch.nn.Module()
+        model.model.language_model.layers = torch.nn.ModuleList([torch.nn.Linear(4, 4)])
+        model.lm_head = torch.nn.Linear(4, 4)
+        return model
+
+    ns = load_pipeline_functions({"QUANTIZATION_SKIP_MODULES", "projector", "quantized_parameter", "validate_quantization"}, {})
+    quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                              llm_int8_skip_modules=ns["QUANTIZATION_SKIP_MODULES"])
+    model = replace_with_bnb_linear(tiny_model(), modules_to_not_convert=quant.llm_int8_skip_modules, quantization_config=quant)
+    assert type(model.model.visual.merger[0]) is torch.nn.Linear
+    assert type(model.model.visual.deepstack_merger_list[0]) is torch.nn.Linear
+    assert type(model.model.visual.blocks[0][0]) is torch.nn.Linear
+    assert type(model.lm_head) is torch.nn.Linear
+    assert isinstance(model.model.language_model.layers[0], bnb.nn.Linear4bit)
+    assert ns["validate_quantization"](model)["nf4_llm_weights"] == 1
+    old = replace_with_bnb_linear(tiny_model(), modules_to_not_convert=["visual", "lm_head"], quantization_config=quant)
+    assert isinstance(old.model.visual.merger[0], bnb.nn.Linear4bit)
+    with pytest.raises(RuntimeError, match="must not be quantized"):
+        ns["validate_quantization"](old)
 
 
 @pytest.mark.parametrize("overflow", [False, True])

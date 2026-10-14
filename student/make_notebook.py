@@ -61,7 +61,7 @@ else:
 os.chdir(REPO)
 sys.path.insert(0, str(REPO))
 assert (REPO / "student/kaggle_runtime.py").exists(), "Push the updated student code to GitHub first"
-from student.kaggle_runtime import configure_hf_token, report_gpu
+from student.kaggle_runtime import configure_hf_token, report_gpu, run_preflight_checks
 from student.resume import restore_output, reusable_stage, record_stage
 if RESUME_FROM:
     restore_output(REPO, RESUME_FROM)
@@ -70,7 +70,7 @@ subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements-cola
 subprocess.run(["nvidia-smi", "-L"], check=True)
 import torch
 GPU_INFO = report_gpu(torch)  # No hard 15 GiB cutoff: show actual device capacity.
-subprocess.run([sys.executable, "-m", "pytest", "-q", "tests", "student/test_kaggle.py", "student/test_resume.py"], check=True)
+run_preflight_checks(REPO)
 print("Preflight passed; result branch:", RESULT_BRANCH)
 ''')
     cell("code", '''# Each subprocess owns and releases its CUDA model; failures skip later experiments.

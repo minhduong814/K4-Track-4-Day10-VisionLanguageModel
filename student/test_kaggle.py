@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from student.kaggle_runtime import configure_hf_token, report_gpu
+from student.kaggle_runtime import configure_hf_token, report_gpu, run_preflight_checks
 from student.make_notebook import build_notebook
 
 
@@ -38,6 +38,25 @@ def test_small_gpu_warns_but_does_not_abort():
 def test_missing_cuda_has_actionable_error():
     with pytest.raises(RuntimeError, match="Enable a CUDA GPU"):
         report_gpu(fake_torch([]))
+
+
+def test_preflight_preserves_failure_details_and_notebook_sync_hint(tmp_path, monkeypatch):
+    from student import kaggle_runtime
+    output = ["FAILED test_notebook_code_compiles_and_every_section_executes\n",
+              "AssertionError: Regenerate with python student/make_notebook.py\n", "1 failed, 94 passed\n"]
+    monkeypatch.setattr(kaggle_runtime.subprocess, "Popen", lambda *a, **kw:
+                        SimpleNamespace(stdout=iter(output), wait=lambda: 1))
+    with pytest.raises(RuntimeError, match="commit and push lab_day10.ipynb") as error:
+        run_preflight_checks(tmp_path)
+    assert "1 failed, 94 passed" in str(error.value)
+    assert (tmp_path / "report/runs/preflight.log.txt").read_text() == "".join(output)
+
+
+def test_successful_preflight_returns_saved_log(tmp_path, monkeypatch):
+    from student import kaggle_runtime
+    monkeypatch.setattr(kaggle_runtime.subprocess, "Popen", lambda *a, **kw:
+                        SimpleNamespace(stdout=iter(["100 passed\n"]), wait=lambda: 0))
+    assert run_preflight_checks(tmp_path).read_text() == "100 passed\n"
 
 
 def test_hf_secret_is_exported_without_printing_value(capsys):

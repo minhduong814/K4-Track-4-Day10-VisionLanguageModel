@@ -1,4 +1,5 @@
-Họ tên: Minh Duong
+Họ tên: Nguyễn Minh Dương
+
 `dataset_version`: `d10-21e4070301`
 
 ## Bảng tổng hợp
@@ -33,10 +34,9 @@ chấm). F1 micro chỉ `0.0458`; precision `0.0413` và recall `0.0515`.
 Hai lỗi chính là output không parse được thành JSON list đúng schema và
 output có box/lớp sai, thường kèm box bịa hoặc sai thang tọa độ. Ví dụ dạng
 output cần loại bỏ khi decode là phần giải thích hoặc fenced JSON như
-```
+
 ```json
 [{"label":"crack","bbox_2d":[...]}]
-```
 ```
 thay vì chỉ trả về JSON list. Sau finetune, parse_valid_rate tăng lên
 0.9968 ở E1 và 1.0 ở E2/E3.

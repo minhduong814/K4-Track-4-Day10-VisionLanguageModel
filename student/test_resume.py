@@ -94,6 +94,23 @@ def test_restore_still_rejects_conflicting_model_weights(tmp_path):
     assert (dest / rel).read_bytes() == b"new weights"
 
 
+def test_restore_recovers_entire_report_snapshot_and_keeps_prior_report_bytes(tmp_path):
+    source = fixture_repo(tmp_path / "source")
+    completed_e0(source)
+    dest = fixture_repo(tmp_path / "dest")
+    restore_saved_output(dest, source)
+    for name in ("report/runs/environment.json", "report/runs/splits.json", "report/evidence/e0.json"):
+        (dest / name).write_text('{"interrupted_current_run":true}')
+    assert not reusable_stage(dest, "e0")
+    assert restore_saved_output(dest, source) > 0
+    assert reusable_stage(dest, "e0")
+    for name in ("report/runs/environment.json", "report/runs/splits.json", "report/evidence/e0.json"):
+        assert (dest / name).read_bytes() == (source / name).read_bytes()
+        backups = list((dest / "work/resume/replaced-reports").glob("*/" + name))
+        assert len(backups) == 1 and backups[0].read_text() == '{"interrupted_current_run":true}'
+    assert restore_saved_output(dest, source) == 0
+
+
 def test_checkpoint_selection_ignores_incomplete_or_incompatible_snapshots(tmp_path):
     for step, signature in [(50, "same"), (100, "same"), (150, "different")]:
         folder = tmp_path / f"resume-step-{step}"

@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 def restore_saved_output(repo, source):
-    """Restore checkpoints strictly; archive conflicting session diagnostics separately."""
+    """Restore a report snapshot with backups, while keeping checkpoint conflicts strict."""
     from student.resume import digest
     repo, source = Path(repo).resolve(), Path(source).resolve()
     if not (source / "work").is_dir():
@@ -38,8 +38,25 @@ def restore_saved_output(repo, source):
             if digest(target) == incoming_hash:
                 continue
             diagnostic = rel.as_posix() in session_files or (rel.parts[:2] == ("report", "runs") and path.name.endswith(".log.txt"))
-            if not diagnostic:
+            if not diagnostic and rel.parts[0] != "report":
                 raise RuntimeError(f"Resume artifact conflicts with working output: {rel}; checkpoint/evidence was not overwritten")
+            if not diagnostic:
+                # environment.json, scores and run metadata belong to the saved snapshot.
+                # Back up current report bytes, then restore the source bytes expected by its receipts.
+                current_hash = digest(target)
+                backup = repo / "work/resume/replaced-reports" / current_hash / rel
+                if not backup.resolve().is_relative_to(repo):
+                    raise ValueError("Invalid report backup path")
+                if backup.exists():
+                    if digest(backup) != current_hash:
+                        raise RuntimeError(f"Corrupted report backup: {backup}")
+                else:
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(target, backup)
+                shutil.copy2(path, target)
+                archived += 1
+                copied += 1
+                continue
             # Keep the current session's log active and preserve the old one by content hash.
             target = repo / "work/resume/imported-logs" / incoming_hash / rel
             if not target.resolve().is_relative_to(repo):
@@ -52,7 +69,7 @@ def restore_saved_output(repo, source):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, target)
         copied += 1
-    print(f"Restored {copied} artifact files; archived {archived} old session logs. Checkpoint compatibility is checked before reuse.")
+    print(f"Restored {copied} artifact files; preserved {archived} conflicting reports/logs in work/resume/. Checkpoint compatibility is checked before reuse.")
     return copied
 
 
@@ -114,6 +131,27 @@ def run_preflight_checks(repo):
         raise RuntimeError(f"Preflight tests failed (exit {code}). {hint}"
                            f"Full log: {log_path}\n\n{details}")
     return log_path
+
+
+def verify_dense_lora_backend():
+    """Exercise E3's dense ViT LoRA dispatch in the actual installed environment."""
+    code = '''import torch
+from peft import LoraConfig, get_peft_model
+class VisionLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.qkv = torch.nn.Linear(8, 8)
+    def forward(self, x):
+        return self.qkv(x)
+model = get_peft_model(VisionLayer(), LoraConfig(r=2, lora_alpha=4, target_modules=["qkv"]))
+model(torch.randn(2, 8)).square().mean().backward()
+grads = [p.grad for n, p in model.named_parameters() if "lora_B" in n]
+assert grads and all(g is not None and torch.isfinite(g).all() for g in grads)
+print("E3 dense LoRA backend: forward/backward passed")
+'''
+    # A fresh process sees packages installed/removed during setup, just like training.
+    subprocess.run([sys.executable, "-u", "-c", code], check=True)
+    return {"dense_lora_forward_backward": "passed"}
 
 
 def report_gpu(torch):

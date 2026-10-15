@@ -101,6 +101,22 @@ def test_real_peft_dense_lora_recovers_after_old_torchao_cleanup(monkeypatch):
         peft_imports.is_torchao_available.cache_clear()
 
 
+def test_installed_dense_lora_backend_in_training_subprocess():
+    pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    from student.kaggle_runtime import verify_dense_lora_backend
+    assert verify_dense_lora_backend() == {"dense_lora_forward_backward": "passed"}
+
+
+def test_notebook_prepares_and_checks_e3_backend_before_experiments():
+    setup = "".join(build_notebook()["cells"][2]["source"])
+    assert "RESUME_FROM = None" in setup
+    assert "restore_output(" not in setup
+    assert setup.index('"pip", "install"') < setup.index("BACKEND_INFO = prepare_optional_backends()")
+    assert setup.index("BACKEND_INFO = prepare_optional_backends()") < setup.index("BACKEND_INFO.update(verify_dense_lora_backend())")
+    assert setup.index("BACKEND_INFO.update(verify_dense_lora_backend())") < setup.index("run_preflight_checks(REPO)")
+
+
 def test_preflight_preserves_failure_details_and_notebook_sync_hint(tmp_path, monkeypatch):
     from student import kaggle_runtime
     output = ["FAILED test_notebook_code_compiles_and_every_section_executes\n",

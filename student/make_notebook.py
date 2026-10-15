@@ -19,6 +19,8 @@ Push this implementation to GitHub first, then import this notebook into Kaggle.
 Enable Internet and GPU, attach the road-damage dataset, and grant access to GITHUB_TOKEN.
 Optionally enable the HF_TOKEN secret for authenticated Hugging Face downloads.
 Choose **Save Version → Save & Run All**. Each section below contains executable cells.
+For a complete new run, start a fresh Kaggle session and keep `RESUME_FROM = None`.
+Setup fixes the optional TorchAO conflict and checks E3 dense LoRA before any experiment.
 Training functions live in `student/pipeline.py`; the notebook calls each step separately and displays its logs.
 E5 is excluded. Complete REPORT.md locally after collecting real results. See KAGGLE.md.
 """)
@@ -33,7 +35,7 @@ SOURCE_REF = "main"
 RESULT_BRANCH = "kaggle-results-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 REPO = Path("/kaggle/working/lab-repo")
 BATCH_SIZE, GRAD_ACCUM = 1, 8
-RESUME_FROM = None  # e.g. "/kaggle/input/previous-notebook-output/lab-repo"
+RESUME_FROM = None  # Full new E0–E4 run. Leave unchanged; no previous Output needed.
 FAIL_VERSION_ON_ERROR = False  # Keep partial Output when a stage fails; status.json still says failed.
 GITHUB_TOKEN = UserSecretsClient().get_secret("GITHUB_TOKEN")
 request = urllib.request.Request("https://api.github.com/repos/minhduong814/K4-Track-4-Day10-VisionLanguageModel",
@@ -61,13 +63,14 @@ else:
 os.chdir(REPO)
 sys.path.insert(0, str(REPO))
 assert (REPO / "student/kaggle_runtime.py").exists(), "Push the updated student code to GitHub first"
-from student.kaggle_runtime import configure_hf_token, report_gpu, run_preflight_checks, prepare_optional_backends, restore_saved_output
+from student.kaggle_runtime import configure_hf_token, report_gpu, run_preflight_checks, prepare_optional_backends, restore_saved_output, verify_dense_lora_backend
 from student.resume import reusable_stage, record_stage
 if RESUME_FROM:
     restore_saved_output(REPO, RESUME_FROM)
 HF_AUTH_ENABLED = configure_hf_token(UserSecretsClient(), os.environ)
 subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements-colab.txt", "pytest"], check=True)
 BACKEND_INFO = prepare_optional_backends()
+BACKEND_INFO.update(verify_dense_lora_backend())
 (REPO / "report/runs").mkdir(parents=True, exist_ok=True)
 (REPO / "report/runs/optional_backends.json").write_text(json.dumps(BACKEND_INFO, indent=2), encoding="utf-8")
 subprocess.run(["nvidia-smi", "-L"], check=True)

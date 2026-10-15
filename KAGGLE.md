@@ -19,14 +19,25 @@ Sau pipeline, cell cuối push `report/` vào nhánh riêng `kaggle-results-<UTC
 Để dùng lại ở **Save Version mới**:
 
 1. Mở Version trước → Output, xác nhận có `lab-repo/work/` và `lab-repo/report/`. Nếu phiên interactive còn sống, có thể Quick Save với tuỳ chọn lưu Output để giữ file trước khi restart; Quick Save không chạy lại pipeline.
-2. Trong notebook mới, **Add Input → Notebook Output**, chọn đúng Version cần tiếp tục. Vẫn attach road-damage dataset gốc.
+2. Trong notebook mới, **Add Input → Notebook Output** cho phép thêm notebook nhưng giao diện có thể không cho chọn Version cụ thể. Nếu cần đúng Version hôm trước, dùng `kagglehub.notebook_output_download` với handle có `/versions/N` như bên dưới. Vẫn attach road-damage dataset gốc.
 3. Sửa biến ở cell setup, ví dụ:
 
    ```python
    RESUME_FROM = "/kaggle/input/ten-notebook-output/lab-repo"
    ```
 
-   Đường dẫn có thể là thư mục cha chứa `lab-repo/`; xem cây Input để lấy tên chính xác. Code chỉ copy `work/` cần cho resume và `report/`, không lấy code hoặc `.git/` của Output cũ. Nếu file xung đột với working output hiện có, code dừng để bảo vệ kết quả: dùng session mới.
+   Để lấy **chính xác một Version**, thay dòng `RESUME_FROM = None` trong cell setup bằng đoạn sau (không cần thêm Notebook Output qua giao diện):
+
+   ```python
+   import kagglehub
+   RESUME_FROM = kagglehub.notebook_output_download(
+       "KAGGLE_USERNAME/NOTEBOOK_SLUG/versions/3"
+   )
+   ```
+
+   Thay username/slug theo URL notebook Kaggle và `3` bằng số Version đã chạy xong E2. Dùng nguyên đường dẫn trả về: hàm restore chấp nhận cả thư mục Output chứa `lab-repo/`. API ghim version được mô tả trong [tài liệu chính thức kagglehub](https://github.com/Kaggle/kagglehub#download-notebook-outputs). Đặt đoạn này ngay tại vị trí cấu hình `RESUME_FROM`, để Save & Run All mới cũng thực thi được; nếu chỉ chạy ở một cell tạm rồi để setup gán lại `None`, resume sẽ không được bật.
+
+   Đường dẫn có thể là thư mục cha chứa `lab-repo/`; xem cây Input để lấy tên chính xác. Code chỉ copy `work/` cần cho resume và `report/`, không lấy code hoặc `.git/` của Output cũ. Nếu log preflight/stage, status hoặc thông tin backend khác phiên hiện tại, bản cũ được lưu riêng ở `work/resume/imported-logs/`, giữ log hiện tại và tiếp tục restore. Nếu trọng số, predictions hoặc evidence xung đột, code vẫn dừng để tránh ghi đè kết quả. Xử lý log nằm ở runtime helper, không đổi fingerprint của E1/E2 đã train.
 4. Save & Run All. Sau khi dựng lại split, E0/train/evaluate đã hoàn tất và tương thích sẽ được bỏ qua; bước đang dở sẽ tiếp tục từ checkpoint. Bảng tổng hợp được tạo lại sau khi đủ tất cả evidence.
 
 Nếu còn **cùng phiên interactive**, sau khi sửa lỗi có thể chạy lại cell định nghĩa `run_stage` (đặt lại `pipeline_error`), rồi chạy từ cell train bị lỗi trở đi; files trong `/kaggle/working` vẫn được kiểm tra/reuse. Nếu chỉ có `report/` trên GitHub và checkpoint/Output đã mất thì không thể khôi phục trọng số.

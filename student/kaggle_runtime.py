@@ -4,7 +4,56 @@ import sys
 import warnings
 import importlib
 import importlib.metadata
+import shutil
 from pathlib import Path
+
+
+def restore_saved_output(repo, source):
+    """Restore checkpoints strictly; archive conflicting session diagnostics separately."""
+    from student.resume import digest
+    repo, source = Path(repo).resolve(), Path(source).resolve()
+    if not (source / "work").is_dir():
+        source = source / "lab-repo"
+    if not (source / "work").is_dir():
+        raise ValueError("RESUME_FROM must contain work/ or lab-repo/work/ from a saved Kaggle Output")
+    session_files = {"report/runs/preflight.log.txt", "report/runs/optional_backends.json",
+                     "report/runs/notebook_stages.json", "report/runs/status.json", "report/submission_check.txt"}
+    candidates = []
+    for folder in (source / "work/adapters", source / "work/resume", source / "report"):
+        if folder.is_dir():
+            candidates.extend(p for p in folder.rglob("*") if p.is_file() and not p.is_symlink())
+    candidates.extend((source / "work").glob("*.jsonl"))
+    copied = archived = 0
+    for path in candidates:
+        rel = path.relative_to(source)
+        if path.name.endswith(".tmp") or not path.resolve().is_relative_to(source):
+            continue
+        if rel.parts[0] == "report" and path.suffix not in {".json", ".md", ".png", ".txt"}:
+            continue
+        target = repo / rel
+        if not target.resolve().is_relative_to(repo):
+            raise ValueError("Invalid resume artifact path")
+        if target.exists():
+            incoming_hash = digest(path)
+            if digest(target) == incoming_hash:
+                continue
+            diagnostic = rel.as_posix() in session_files or (rel.parts[:2] == ("report", "runs") and path.name.endswith(".log.txt"))
+            if not diagnostic:
+                raise RuntimeError(f"Resume artifact conflicts with working output: {rel}; checkpoint/evidence was not overwritten")
+            # Keep the current session's log active and preserve the old one by content hash.
+            target = repo / "work/resume/imported-logs" / incoming_hash / rel
+            if not target.resolve().is_relative_to(repo):
+                raise ValueError("Invalid diagnostic archive path")
+            if target.exists():
+                if digest(target) != incoming_hash:
+                    raise RuntimeError(f"Corrupted diagnostic archive: {target}")
+                continue
+            archived += 1
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+        copied += 1
+    print(f"Restored {copied} artifact files; archived {archived} old session logs. Checkpoint compatibility is checked before reuse.")
+    return copied
 
 
 def configure_hf_token(secrets, environ):

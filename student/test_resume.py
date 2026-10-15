@@ -8,6 +8,7 @@ import pytest
 
 from student.resume import (BatchStream, atomic_json, compatible_checkpoint, digest, prune_checkpoints,
                             record_stage, restore_output, reusable_stage, stage_signature)
+from student.kaggle_runtime import restore_saved_output
 
 
 def fixture_repo(root):
@@ -60,6 +61,37 @@ def test_restore_notebook_output_preserves_work_and_report_but_not_code_or_git(t
     (dest / "work/e0_test.jsonl").write_text("new output")
     with pytest.raises(RuntimeError, match="conflicts"):
         restore_output(dest, source)
+
+
+def test_restore_archives_session_log_conflicts_and_reuses_completed_stage(tmp_path):
+    source = fixture_repo(tmp_path / "source")
+    completed_e0(source)
+    dest = fixture_repo(tmp_path / "dest")
+    for name in ("preflight.log.txt", "optional_backends.json", "status.json", "notebook_stages.json", "train_e2.log.txt"):
+        old, current = source / "report/runs" / name, dest / "report/runs" / name
+        current.parent.mkdir(parents=True, exist_ok=True)
+        old.write_text("old diagnostic")
+        current.write_text("current diagnostic")
+    assert restore_saved_output(dest, source) > 0
+    assert reusable_stage(dest, "e0")
+    for name in ("preflight.log.txt", "optional_backends.json", "status.json", "notebook_stages.json", "train_e2.log.txt"):
+        assert (dest / "report/runs" / name).read_text() == "current diagnostic"
+        archived = list((dest / "work/resume/imported-logs").rglob(name))
+        assert len(archived) == 1 and archived[0].read_text() == "old diagnostic"
+    assert restore_saved_output(dest, source) == 0
+
+
+def test_restore_still_rejects_conflicting_model_weights(tmp_path):
+    source = fixture_repo(tmp_path / "source")
+    dest = fixture_repo(tmp_path / "dest")
+    rel = "work/adapters/e2/final/projector.pt"
+    for root, value in [(source, b"old weights"), (dest, b"new weights")]:
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(value)
+    with pytest.raises(RuntimeError, match="checkpoint/evidence was not overwritten"):
+        restore_saved_output(dest, source)
+    assert (dest / rel).read_bytes() == b"new weights"
 
 
 def test_checkpoint_selection_ignores_incomplete_or_incompatible_snapshots(tmp_path):
